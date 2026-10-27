@@ -50,14 +50,18 @@ mantienen tal cual.
   petición que encadena OOM → UAF → forja de `zend_array` → llamada a
   `system()` no llegó a ejecutar código de forma observable en este entorno.
 
-- **El bloqueo está identificado y medido, no es una incógnita.** Tras el OOM,
-  el array colgante conserva `pDestructor == zval_ptr_dtor` (no `zif_system`) y
-  `nTableSize == 8`: el puntero al destructor y el tamaño de la tabla sobreviven
-  intactos, pero el refcount y los flags son basura. Los dos requisitos que
-  faltan son (a°) que un allocation de 56 B aterrice exactamente en el slot
-  liberado — alcanzable con spray, no con control exacto — y (b°) que ese
-  allocation escriba `zif_system` en el offset `0x30` manteniendo una tabla
-  hash válida con un bucket `IS_STRING`. Detalle en **§10.11-bis** del artículo.
+- **El bloqueo está identificado y medido, no es una incógnita.** El volcado
+  crudo de memoria del array colgante (§10.11-ter) muestra que sus últimos
+  24 bytes fueron sobrescritos por el allocator: `pDestructor` vale
+  `arr + 0x50` y `arData` vale `arr + 0x30` — **basura auto-referencial, no
+  punteros a función**. Una versión anterior de este README afirmaba que
+  `pDestructor` conservaba `zval_ptr_dtor`; era una inferencia y la
+  medición la refutó. Los requisitos que faltan son (a°) que un allocation de
+  56 B aterrice exactamente en el slot liberado — alcanzable con spray, no con
+  control exacto — y (b°) que ese allocation **reconstruya** a la vez el
+  `pDestructor` del offset `0x30` y una `arData` válida del offset `0x10`
+  con su tabla de buckets y un bucket `IS_STRING`. Detalle en **§10.11-bis**
+  y **§10.11-ter** del artículo, y en los logs crudos de `evidence/`.
 
 - **Por tanto, `php2shell_rce.py` y `php2shell_rce_exploit.py` son andamiaje
   de investigación, no exploits funcionales.** No los trates como

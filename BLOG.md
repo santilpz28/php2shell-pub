@@ -1016,12 +1016,27 @@ Los valores del estado liberado son la firma clásica:
 | `flags` | `0x8` | `0x0` | flags pisados por la reasignación |
 | `nNumUsed` | 0 | 1 | bucket reutilizado |
 | `nTableSize` | 8 | 8 | sobrevive: por eso el crash es tardío |
-| `pDestructor` | `zval_ptr_dtor` | `zval_ptr_dtor` | sobrevive intacto |
+| `pDestructor` | `zval_ptr_dtor` | `arr + 0x50` | **basura** (ver §10.11-ter) |
 
-Que `nTableSize` y `pDestructor` sobrevivan intactos explica la ventana
-del fallo: la corrupción no es total. El `gc.refcount` disparado a
-`0x9D2C…` es lo que, más tarde, hace que `zend_mm_alloc_small` siga una
-lista de libres corrupta y muera en `zend_mm_alloc_small`.
+> ### ⚠️ Corrección (2026-10-27, con volcado crudo de memoria)
+>
+> Esta tabla afirmaba que `pDestructor` sobrevivía intacto como
+> `zval_ptr_dtor`. **Era una inferencia, no una medición.** Al volcar los
+> bytes crudos del array colgante (§10.11-ter) resulta que los **últimos 24
+> bytes del slot fueron sobrescritos por el allocator**: `pDestructor` vale
+> `arr + 0x50` (un puntero auto-referencial dentro del propio array), no la
+> dirección de ninguna función. `arData` por su parte vale `arr + 0x30`.
+>
+> La corrupción **no** es parcial como se suponía: los offsets `0x00`–`0x2F`
+> siguen siendo válidos (refcount, flags, nTableMask, nNumUsed,
+> nTableSize), pero `arData` y `pDestructor` —justo los dos campos que la
+> cadena de destrucción necesita— son basura.
+>
+> Esto **empeora** el reto de la RCE respecto a lo que se suponía: no basta
+> con colocar un puntero a función en el offset `0x30`; hay que reconstruir
+> además una `arData` válida con su tabla de buckets. El `gc.refcount`
+> disparado a `0x9D2C…` es lo que, más tarde, hace que `zend_mm_alloc_small`
+> siga una lista de libres corrupta y muera en `zend_mm_alloc_small`.
 
 ### 10.6 El tamaño del slot: por qué el spray clásico nunca funcionó
 
@@ -1412,9 +1427,13 @@ if (ht->nNumUsed) {                              /* <- solo si hay buckets */
 }
 ```
 
-En el array colgante medido, `nNumUsed = 0`: el `pDestructor` **nunca llega
-a invocarse** y el crash procede de `arData` corrupto. La forja del gadget
-tiene que producir además un array con al menos un bucket ocupado.
+En el array colgante medido, el `pDestructor` **nunca llega a invocarse** y
+el crash procede de `arData` corrupto. El volcado crudo (§10.11-ter) mide
+`nNumUsed = 1` en el instante en que `php_session_rfc1867_cleanup()` lee el
+array, pero `arData` vale `arr + 0x30` — basura auto-referencial — así que la
+tabla de buckets no es direccionable y el destructor no se alcanza a través
+de ella. La forja del gadget tiene que producir además un array con al
+menos un bucket ocupado **y** una `arData` válida que apunte a él.
 
 El resto de la secuencia en `php_session_track_init()`:
 
@@ -1423,9 +1442,12 @@ array_init(&session_vars);                   /* emalloc(56) */
 ```
 
 **Lo que se midió en el binario instrumentado:** después del OOM, el array
-colgante **conserva** `pDestructor == zval_ptr_dtor` y `nTableSize == 8`.
-La corrupción es parcial: el refcount y los flags son basura, pero el puntero
-al destructor y el tamaño de la tabla sobreviven intactos.
+colgante conserva `nTableSize == 8` y los primeros 48 bytes en pie, pero
+**`pDestructor` NO conserva `zval_ptr_dtor`**: el volcado crudo de memoria
+(§10.11-ter) muestra que vale `arr + 0x50`, es decir basura auto-referencial.
+Lo mismo ocurre con `arData`, que vale `arr + 0x30`. La corrupción no es
+parcial como se suponía: afecta justamente a los dos campos que la cadena
+de destrucción necesita.
 
 Eso define exactamente lo que falta:
 
@@ -1434,10 +1456,11 @@ Eso define exactamente lo que falta:
 | El `zend_array` liberado es de 56 bytes (bin 6) | ✅ medido |
 | La posición del slot en el pool es predecible | ✅ medido (elemento 14, paso 0x38) |
 | El siguiente allocation de 56 B lo reutiliza | ⚠️ 28,4 % por intento (LIFO, por páginas) |
-| El `pDestructor` del slot es un gadget invocable | ❌ **sigue siendo `zval_ptr_dtor`** |
+| El `pDestructor` del slot es un gadget invocable | ❌ **ni siquiera es un puntero a función: es `arr + 0x50` (basura)** |
 | El gadget tiene firma `void f(void *)` compatible | ⚠️ **`zif_system` NO lo es** (firma de 2 args) |
 | Un bucket `IS_STRING` con el comando | ❌ no alcanzado |
-| El array colgante tiene `nNumUsed >= 1` | ❌ medido `nNumUsed = 0` (el `pDestructor` ni se invoca) |
+| El array colgante tiene `nNumUsed >= 1` | ✅ medido `nNumUsed = 1` en el volcado crudo; pero `arData` es basura, así que el bucket no es direccionable |
+| El `arData` del slot apunta a una tabla de buckets válida | ❌ **vale `arr + 0x30` (basura auto-referencial)** |
 
 **Los requisitos que bloquean la RCE son el cuarto, el quinto y el séptimo.**
 Para superarlos hacen falta tres cosas a la vez:
@@ -1473,6 +1496,97 @@ spray de 56 bytes con la precisión de puntero necesaria. La imagen
 `php2shell_rce_exploit.py` ejecuta el escenario real y reporta el estado del
 gadget en cada intento, de modo que el progreso es medible, pero **no
 produce ejecución de código**.
+
+### 10.11-ter El volcado crudo: por qué el `pDestructor` NO sobrevive
+
+La sección anterior daba por hecho que el `pDestructor` del array colgante
+seguía siendo `zval_ptr_dtor`. Para comprobarlo en vez de suponerlo, se
+instrumentó `php_session_rfc1867_cleanup()` con un volcado de los 8 bytes
+crudos del `zend_array` en el instante exacto en que lo lee.
+
+**Método.** En el bloque de traza del `CLEANUP` se añadió:
+
+```c
+unsigned long *w = (unsigned long *)arr;
+for (int i = 0; i < 8; i++) {
+    fprintf(pf, "  +0x%02zx = 0x%016lx\n", (unsigned)(i*8), (unsigned long)w[i]);
+}
+```
+
+El módulo se compiló y se cargó con `MaxRequestWorkers 1` (mismo worker
+obligatorio) y ASLR activo, leyendo la base del mapeo desde
+`/proc/<pid>/maps` para resolver los símbolos.
+
+**Resultado (corrida real, logs crudos en `evidence/`):**
+
+```
+PEEK2 arr=0x728fa6655310 ps_vars=0x728fa5823760
+  +0x00 = 0x0000000700000001
+  +0x08 = 0xfffffff000000000
+  +0x10 = 0x0000728fa6655340
+  +0x18 = 0x0000000100000001
+  +0x20 = 0x0000000000000008
+  +0x28 = 0x8000000000000000
+  +0x30 = 0x0000728fa6655360
+  +0x38 = 0x0000728fa6655380
+```
+
+Con base `0x728fa4a87000`:
+
+- `zval_ptr_dtor` → `0x728fa4e60950` (offset `0x3d9950`)
+- `zif_system` → `0x728fa4d94560` (offset `0x30d560`)
+
+**Interpretación campo a campo:**
+
+| Offset | Campo | Valor observado | Lectura |
+|---|---|---|---|
+| 0x00 | `gc.refcount` | 1 | intacto |
+| 0x08 | `u.flags` | 0x07 | intacto |
+| 0x0C | `nTableMask` | 0xfffffff0 | intacto |
+| 0x10 | **`arData`** | **`arr + 0x30`** | **basura auto-referencial** |
+| 0x18 | `nNumUsed` / `nNumOfElements` | 1 / 1 | intacto |
+| 0x20 | `nTableSize` | 8 | intacto |
+| 0x28 | `nNextFreeElement` | 0x8000000000000000 | intacto |
+| 0x30 | **`pDestructor`** | **`arr + 0x50`** | **basura, NO es `zval_ptr_dtor`** |
+| 0x38 | (fuera del array) | `arr + 0x70` | — |
+
+**Lo que esto corrige.** El `pDestructor` del array colgante **no** es
+`zval_ptr_dtor` ni ninguna otra función: es un puntero que apunta a
+`arr + 0x50`, es decir a un campo del propio array. Y `arData` —el puntero
+a la tabla de buckets— vale `arr + 0x30`, también basura.
+
+Es la firma de un slot **reutilizado**: el allocator colonizó el bloque de
+56 bytes con un patrón de punteros auto-referenciales. El patrón
+`arr+0x30` / `arr+0x50` / `arr+0x70` es una progresión regular de paso
+`0x20`, típica de un allocator que encadena bloques libres.
+
+**Consecuencia para la RCE — es peor de lo que se suponía.** La hipótesis
+anterior era "el `pDestructor` sobrevive, solo falta sustituirlo por
+`zif_system`". La realidad medida es que:
+
+1. El campo `pDestructor` hay que **reconstruirlo** entero, no sustituirlo.
+2. El campo `arData` también es basura: sin una tabla de buckets válida no
+   hay ningún `zval` al que pasarle el comando, así que
+   `ht->pDestructor(&p->val)` no tiene de dónde leer el comando.
+3. Es decir: **no basta un solo write de 8 bytes en el slot.** Hace falta
+   que un allocation de 56 bytes aterrice en esa posición concreta *y* que
+   tenga el contenido correcto en los offsets `0x10` y `0x30` a la vez.
+
+Esto **confirma** el diagnóstico de clase de tamaño (bin 6) y **reforza**
+la conclusión de que el spray clásico de 288 B de los writeups no puede
+servir: ni por clase de tamaño, ni por contenido.
+
+**El punto que sigue abierto:** ¿es posible que un allocation de 56 B con
+contenido elegido por el atacante aterrice en ese slot con el 28,4 % de
+probabilidad por intento? Esa es la pregunta que queda abierta, y la
+respuesta es lo que separa esta investigación de un exploit funcional.
+
+**Nota metodológica.** Este hallazgo es el argumento principal para
+instrumentar el binario en vez de razonar sobre el código: la inferencia
+"el puntero al destructor sobrevive" era plausible, razonada, coherente con
+el modelo del advisory oficial — y **falsa**. El volcado de 64 bytes la
+refutó en un minuto. Un lector que se fie de la lectura del artículo en
+lugar del volcado habría construido el PoC sobre una premisa rota.
 
 ### 10.12 Validación contra el advisory oficial (`GHSA-6wmf-4rv5-p3rp`)
 
@@ -1662,7 +1776,7 @@ Y contra el target parcheado (8081), el mismo detector no debe observar
 | Versiones parcheadas por rama | Anuncios oficiales de PHP y boletines de Akamai/JFrog/CISA |
 | Que `zif_system` **no** es un gadget válido | Lectura de los macros del core: `ZEND_FUNCTION` → `void (zend_execute_data *, zval *)` (`Zend/zend_API.h:71`, `Zend/zend.h:49`) vs `dtor_func_t` → `void (*)(zval *)` (`Zend/zend_types.h:104`). `php_exec_ex` lee el comando del `execute_data` (`ext/standard/exec.c:206`) |
 | Layout real de `zend_array`, `zend_object`, `Bucket`, `zval`, `zend_string` | Programa de `offsetof` compilado contra los headers reales de PHP 8.2.34: `zend_array` 56 B (`pDestructor` en **0x30**), `zend_object` 56 B, `Bucket` 32 B (`val` en 0x00), `zval` 16 B, `zend_string` 32 B (`val` en 0x18) |
-| Que el `pDestructor` personalizado solo se invoca con buckets | `Zend/zend_hash.c:1755-1760`; medido en el array colgante: `nNumUsed = 0` |
+| Que el `pDestructor` personalizado solo se invoca con buckets | `Zend/zend_hash.c:1755-1760`; medido en el array colgante: `nNumUsed = 1` pero con `arData` corrupto, así que el bucket no es direccionable |
 | Que el allocator usa free-list LIFO por bin | `zend_mm_free_small` / `zend_mm_alloc_small` (`Zend/zend_alloc.c:1300-1338`) + traza: `FREE_SMALL 0x...41c0` seguido de `ALLOC_SMALL 0x...41c0` |
 | Reutilización inmediata del slot liberado | Traza del allocator: el slot liberado se recicla en la operación siguiente (28,4 % por intento entre conflictos de free-list) |
 | Que el crash es corrupción del heap, no un fallo arbitrario | Log de Apache: `zend_mm_heap corrupted` antes del `SIGSEGV` |
@@ -1677,7 +1791,7 @@ Y contra el target parcheado (8081), el mismo detector no debe observar
 | Que la inyección en el fichero de sesión es posible | El `filename` del upload se almacena literal en el fichero de sesión (verificado leyendo `/tmp/sess_*`) |
 | Que el mecanismo de RCE real usa una tabla hash con `pDestructor`, no una `zend_internal_function` | Lectura del código fuente de PHP: `zend_array_destroy` invoca `ht->pDestructor` con un `zval*`, coherente con `dtor_func_t` (`void (*)(zval *)`) |
 | Que **`zif_system` NO es un gadget válido** (corrección posterior) | Lectura de los macros del core: `ZEND_FUNCTION` se expande a `void (zend_execute_data *, zval *)` (`Zend/zend_API.h:71`, `Zend/zend.h:49`), firma de **dos** argumentos incompatible con `dtor_func_t`. `php_exec_ex` toma el comando del `execute_data` (`ext/standard/exec.c:206`), no del puntero recibido. **Este punto corrige el planteo original de este artículo y de los writeups que lo replican** |
-| Que el `pDestructor` personalizado solo se invoca si hay buckets | Lectura de `zend_array_destroy` (`Zend/zend_hash.c:1755-1760`): `if (ht->nNumUsed) { if (ht->pDestructor != ZVAL_PTR_DTOR) ... }`. Medido: el array colgante tiene `nNumUsed = 0` |
+| Que el `pDestructor` personalizado solo se invoca si hay buckets | Lectura de `zend_array_destroy` (`Zend/zend_hash.c:1755-1760`): `if (ht->nNumUsed) { if (ht->pDestructor != ZVAL_PTR_DTOR) ... }`. Medido en el volcado crudo: `nNumUsed = 1`, pero `arData` es basura |
 | Que el allocator de Zend MM usa free-list LIFO por bin | Lectura de `zend_mm_free_small` / `zend_mm_alloc_small` (`Zend/zend_alloc.c:1300-1338`): el slot liberado se inserta en la cabeza de `free_slot[bin]` y el alloc lo toma de la cabeza. Medido en la traza: `FREE_SMALL 0x...41c0` seguido de `ALLOC_SMALL 0x...41c0` |
 | El layout real de `zend_array` (`pDestructor` en 0x30) y de las estructuras candidatas | Programa de `offsetof` compilado contra los headers reales de PHP 8.2.34: `zend_array` 56 B (`pDestructor` 0x30), `zend_object` 56 B, `Bucket` 32 B (`val` 0x00), `zval` 16 B, `zend_string` 32 B (`val` 0x18) |
 | Que el crash **no depende** del `PHPSESSID` del Request B | Control A/B: Request B con SID idéntico (crash 4/4) vs SID distinto (crash 4/4) |
