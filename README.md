@@ -15,6 +15,78 @@
 
 ---
 
+## ⚠️ Disclaimer de estado — leer antes de usar este repositorio
+
+Este disclaimer se añadió **al cierre del trabajo** para que nadie confunda
+"código publicado" con "cadena de explotación verificada". No implica que el
+resto del material haya sido modificado: el artículo, los PoC y los scripts se
+mantienen tal cual.
+
+### Qué está verificado de extremo a extremo
+
+| Artefacto | Estado |
+|---|---|
+| Análisis del código fuente de PHP 8.2.34 (`ext/session/session.c`) | ✅ Verificado directamente |
+| Lectura y contraste del parche oficial `31c0ea7d7ff` | ✅ Verificado directamente |
+| Layout de `zend_internal_function` (size=136, `handler` en offset 72) | ✅ Verificado con programa `offsetof` contra `Zend/zend_compile.h` |
+| Test diferencial vulnerable/parcheado (`behavioural_diff.py`) | ✅ Ejecutado contra 8.2.34 y 8.2.35 reales |
+| Mecanismo del UAF con direcciones reales y tamaño del slot | ✅ Medido en el binario instrumentado |
+| Tamaño del `zend_array` liberado (56 B, bin 6) y posición en el pool (elemento 14, paso 0x38) | ✅ Medido |
+| Reutilización del slot liberado por el siguiente allocation de 56 B | ⚠️ 28,4 % por intento (LIFO, por páginas) |
+| Mapping contra el advisory oficial `GHSA-6wmf-4rv5-p3rp` (producer/consumer) | ✅ Contrastado punto por punto |
+| Componentes del PoC de RCE (spray, timing, forja de la struct, extracción de offsets) | ✅ Implementados y verificados por separado |
+
+### Qué **no** está verificado
+
+- **La cadena de RCE completa no se reprodujo de principio a fin.** La imagen
+  `php2shell-rce:8.2.34` compila y sirve tráfico, pero el tránsito de la
+  petición que encadena OOM → UAF → forja de `zend_array` → llamada a
+  `system()` no llegó a ejecutar código de forma observable en este entorno.
+
+- **El bloqueo está identificado y medido, no es una incógnita.** Tras el OOM,
+  el array colgante conserva `pDestructor == zval_ptr_dtor` (no `zif_system`) y
+  `nTableSize == 8`: el puntero al destructor y el tamaño de la tabla sobreviven
+  intactos, pero el refcount y los flags son basura. Los dos requisitos que
+  faltan son (a°) que un allocation de 56 B aterrice exactamente en el slot
+  liberado — alcanzable con spray, no con control exacto — y (b°) que ese
+  allocation escriba `zif_system` en el offset `0x30` manteniendo una tabla
+  hash válida con un bucket `IS_STRING`. Detalle en **§10.11-bis** del artículo.
+
+- **Por tanto, `php2shell_rce.py` y `php2shell_rce_exploit.py` son andamiaje
+  de investigación, no exploits funcionales.** No los trates como
+  weaponizables. Su valor es otro: ejecutan el escenario real y **reportan el
+  estado del gadget en cada intento**, de modo que el progreso es medible y
+  otro investigador con un entorno más adecuado puede continuar desde ahí.
+
+- **El spray clásico de 288 bytes de los writeups públicos no sirve** para este
+  mecanismo (§10.6): no se modeló un spray de 56 bytes con la precisión de
+  puntero necesaria. No se construyeron allocations con contenido elegido por
+  el atacante.
+
+- **Las cifras del spray (149 × 288 bytes) proceden del análisis público de
+  Akamai**, no de una calibración propia. El layout de la estructura forjada sí
+  se contrastó de forma independiente contra el código fuente de PHP.
+
+- **El detector funcional (`behavioural_diff.py`) sí es la pieza operativa
+  válida**: distingue vulnerable de parcheado por comportamiento observable,
+  sin offsets, sin ASLR y sin ejecutar exploits. Es la recomendada para
+  inventariar exposición en flota.
+
+### Advertencia operativa
+
+- **No ejecutes esto fuera de un entorno aislado.** Los contenedores están
+  deliberadamente configurados con ASLR desactivado, `mpm_prefork` y PHP 8.2.34
+  sin parche. Eso los hace vulnerables **a propósito**.
+- **Audita cualquier PoC de terceros antes de ejecutarlo.** Se documenta
+  (JFrog) que algunos repositorios públicos para estas CVEs distribuyen cargas
+  maliciosas falsas — en algún caso, un script que solo modificaba el fondo de
+  pantalla del sistema.
+- **El blog distingue en cada sección si una afirmación es verificación propia
+  o análisis público.** Si vas a citarlo comercialmente, mantén esa distinción:
+  es lo que sostiene la credibilidad del trabajo.
+
+---
+
 ## Qué es esto
 
 El 21 de octubre de 2026 el proyecto PHP publicó una release de emergencia
@@ -121,7 +193,8 @@ ni de precisión, ni de ASLR: es un problema de **clase de tamaño**.
 | `check_exposure.sh` | Sonda de exposición de una pasada. `exit 1` = vulnerable, `exit 0` = parcheado |
 | `behavioural_diff.py` | Test diferencial vulnerable/parcheado con controles A/B |
 | `php2shell_leak.py` | Detector del UAF con controles negativos |
-| `php2shell_rce.py` | Andamiaje de la escalada: monta el escenario real y recoge la traza |
+| `php2shell_rce.py` | Andamiaje de la escalada: monta el escenario real y recoge la traza. **⚠️ En desarrollo — la cadena completa de RCE no se reprodujo de extremo a extremo (ver disclaimer arriba).** |
+| `php2shell_rce_exploit.py` | Ejecuta el escenario real y reporta el estado del gadget por intento. **⚠️ No produce ejecución de código (ver disclaimer arriba).** |
 | `patches/` | Parches idempotentes que instrumentan el propio PHP (sesión + allocator) |
 | `web/` | Endpoints del laboratorio |
 
