@@ -58,6 +58,14 @@ Request B  multipart con PHP_SESSION_UPLOAD_PROGRESS y SIN file part
 Esto explica por qué el parche oficial sustituye el `longjmp` por un error
 blando, y por qué `pm.max_requests=1` rompe la explotabilidad en PHP-FPM.
 
+> **Validado contra el advisory oficial** (`GHSA-6wmf-4rv5-p3rp`, 21-oct-2026).
+> PHP describe el fallo en abstracto —«*global state retained by a worker but
+> pointing to memory owned by one request*», «*a fatal error, including one
+> caused by memory exhaustion*»— y propone un modelo de **productor + consumidor**
+> en requests distintos del mismo worker. La rama `session.upload_progress` que
+> se mide aquí es **una** concreción de ese modelo; el mapping punto por punto
+> está en [`BLOG.md` §10.12](BLOG.md).
+
 **Y tiene una consecuencia práctica que casi se menciona:** el ataque **no
 tiene ritmo**. La primera descripción del ataque —una pausa de red de más de
 un segundo para que expire `session.upload_progress.min_freq`— era
@@ -159,11 +167,22 @@ parciales por diseño.
 
 | Versión parcheada | 8.2.35 · 8.3.36 · 8.4.27 · 8.5.12 |
 |---|---|
-| **PHP 7.4** | **EOL — sin parche. Vulnerable para siempre.** |
+| **PHP 7.4 / 8.0 / 8.1** | Fuera de soporte del proyecto PHP, pero **PHP ha publicado backports mínimos de código fuente**. Actualiza al paquete de tu distro o a un backport, no a una versión EOL tal cual. |
+
+> ⚠️ **Corrección (27-oct-2026, 23:20):** versiones anteriores de este README
+> afirmaban que PHP 7.4 quedaría «vulnerable para siempre». **Es incorrecto**:
+> el proyecto PHP publicó backports mínimos para 7.4, 8.0 y 8.1. Lo que sí
+> es cierto es que esas ramas no reciben el ciclo regular de desarrollo, así
+> que la actualización depende de tu distro o de aplicar el backport a mano.
+> Verificado contra el advisory de NCSC-NL y el advisory oficial
+> `GHSA-6wmf-4rv5-p3rp`.
 
 Mitigaciones parciales (defensa en capas, no sustituyen al parche):
 
 ```ini
+; Recomendada por el propio proyecto PHP (advisory del 23-oct-2026)
+session.upload_progress.enabled = 0
+
 ; Corta el trigger del OOM (no el UAF)
 max_multipart_body_parts = 2000
 max_file_uploads = 100
@@ -171,6 +190,15 @@ max_file_uploads = 100
 ; Reduce el impacto del UAF
 pm.max_requests = 1        ; rompe el requisito de "mismo worker" (solo FPM)
 ```
+
+> **CVE-2026-115560.** El 23 de octubre, PHP publicó un aviso informativo
+> sobre un vector de RCE residual ( improbable en la práctica: requiere
+> `session.serialize_handler` = `php_binary`/`php_serialize` y luego cambiarlo
+> a `php` en runtime con `ini_set()` antes de `session_start()`).
+> La mitigación recomendada por el proyecto es
+> `session.upload_progress.enabled=0` hasta la siguiente release regular.
+> **El advisory oficial `GHSA-6wmf-4rv5-p3rp` ya listaba esa mitigación
+> desde el 21 de octubre.**
 
 > ⚠️ **No desactives OPcache en producción.** Con OPcache el UAF puede
 > manifestarse de forma silenciosa en vez de con SIGSEGV. Eso es **peor**: no
@@ -190,6 +218,29 @@ pm.max_requests = 1        ; rompe el requisito de "mismo worker" (solo FPM)
   direcciones medidas son relativas a la base de cada ejecución.
 
 ---
+
+## Other languages
+
+**English edition:** https://github.com/santilpz28/php2shell-pub-en
+(`BLOG.en.md`, `README.en.md`, `PUBLICATION.en.md`, `NOTES-alloc-trace.en.md`)
+
+## Publicación
+
+Los textos listos para publicar (post de LinkedIn, hilo de Twitter/X, newsletter)
+y la descripción/topics del repo están en
+[`PUBLICATION.md`](PUBLICATION.md).
+
+## Citar este trabajo
+
+```bibtex
+@misc{php2shell_chaincortex_2026,
+  title  = {PHP2Shell — Anatomía de CVE-2026-109618 y CVE-2026-109619},
+  author = {Santiago L{\'o}pez (Chain-Cortex)},
+  year   = {2026},
+  url    = {https://github.com/santilpz28/php2shell-pub},
+  note   = {Investigación de seguridad. Uso defensivo.}
+}
+```
 
 ## Licencia
 

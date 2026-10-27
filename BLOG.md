@@ -9,6 +9,11 @@
 
 ---
 
+> **English edition:** the full article is also published in English at
+> https://github.com/santilpz28/php2shell-pub-en
+
+---
+
 ## 0. TL;DR para el que tiene 30 segundos
 
 El 21 de octubre de 2026 el proyecto PHP publicó una release de emergencia que corregía **dos** vulnerabilidades críticas en el **núcleo** del lenguaje, no en ninguna aplicación:
@@ -24,9 +29,22 @@ Lo que lo hace especialmente nasty:
 - **No requiere autenticación.** No hay que pasar por un login.
 - **No requiere configuración exótica.** `session.upload_progress.enabled=On` es el **default de fábrica** desde PHP 5.
 - **El parche fue de emergencia** (21 oct, 14:00 UTC) porque los detalles se filtraron antes de la divulgación oficial. CISA, Cisco, Akamai, Vercel, Laravel, Autodesk, IC3 y CERT-EU publicaron alertas el mismo día.
-- **PHP 7.4 es EOL y no recibirá parche.** Sigue vulnerable para siempre.
+- **PHP 7.4, 8.0 y 8.1 están fuera del ciclo regular de desarrollo**, pero el
+  proyecto PHP **sí publicó backports mínimos de código fuente** para esas
+  ramas. Lo que no existe es el ciclo regular de releases: la actualización
+  depende del paquete de tu distro o de aplicar el backport a mano.
 
 Y un detalle que explica el nombre: el mecanismo de entrega es esencialmente **Heartbleed aplicado a PHP**. Al igual que en Heartbleed, un atacante puede leer memoria del proceso — incluyendo datos de *otros* usuarios — antes de poder escalar a ejecución de código.
+
+> **Validado contra el advisory oficial.** El advisory del proyecto PHP
+> (`GHSA-6wmf-4rv5-p3rp`, 21-oct-2026) describe el fallo en términos
+> abstractos —«*global state retained by a worker but pointing to memory owned
+> by one request*», «*a fatal error, **including one caused by memory
+> exhaustion***», «*a later operation that runs before normal request
+> initialization can consume the stale value*»— y propone un modelo de
+> **productor + consumidor** en requests distintos del mismo worker. La rama
+> `session.upload_progress` que se mide aquí es **una** concreción de ese
+> modelo. El mapping punto por punto está en §10.12.
 
 **El eslabón que casi nadie menciona:** la cadena no empieza con un UAF, sino
 con un **agotamiento de memoria**. El atacante provoca un OOM durante el parseo
@@ -484,7 +502,7 @@ foreach ($_SESSION as $k => $v) {
 | 8.3.x | **8.3.36** | Soportada |
 | 8.4.x | **8.4.27** | Soportada |
 | 8.5.x | **8.5.12** | Soportada (añade `fatal_error_backtraces=0`) |
-| 7.4.x | — | **EOL, sin parche. Vulnerable para siempre.** |
+| 7.4.x | backport mínimo publicado por PHP | Fuera del ciclo regular: actualizar vía distro o backport manual |
 
 ---
 
@@ -640,7 +658,7 @@ En el shutdown, todo el estado de larga vida (backtrace, OPcache, sesión, estad
 | Acción | Prioridad |
 |---|---|
 | Actualizar a **8.2.35 / 8.3.36 / 8.4.27 / 8.5.12** | **Inmediata** |
-| Si usas **7.4**: migrar ya. No hay parche. | **Crítica** |
+| Si usas **7.4 / 8.0 / 8.1**: migrar al ciclo soportado, o aplicar el backport de PHP. | **Crítica** |
 | Reiniciar **todos** los workers tras actualizar (Apache + FPM + php-fpm reload) | **Inmediata** |
 | Verificar la versión real en runtime, no la del paquete | **Inmediata** |
 
@@ -788,7 +806,7 @@ curl -sI https://tu-sitio/ | grep -i "^x-powered-by\|^server"
 find / -name "php" -type f -perm -u+x 2>/dev/null | head -20
 ```
 
-Prioridad real: **PHP 7.4 + cualquier cosa que acepte uploads = RCE sin autenticación.**
+Prioridad real: **PHP 7.4/8.0/8.1 + cualquier cosa que acepte uploads = RCE sin autenticación**, por estar fuera del ciclo regular de releases.
 
 ---
 
@@ -1251,6 +1269,140 @@ asignación y cada liberación del bin 6.
 
 ---
 
+### 10.11-bis El intento de escalada a RCE: qué se midió y qué falta
+
+Con el mecanismo del UAF verificado y el gadget localizado en el código
+fuente, se puede enunciar la primitiva con precisión:
+
+```c
+/* Zend/zend_types.h:104 */
+typedef void (*dtor_func_t)(zval *pDest);
+
+/* Zend/zend_hash.c:1701 — la invocación */
+ht->pDestructor(&p->val);
+
+/* Zend/zend_hash.c:1757 — la condición */
+if (UNEXPECTED(ht->pDestructor != ZVAL_PTR_DTOR)) {
+    zend_hash_destroy(ht);
+    goto free_ht;
+}
+```
+
+`ZEND_FUNCTION(system)` tiene la firma `void system(zval *, ...)`, compatible
+con `dtor_func_t`. Por tanto: **si el `zend_array` liberado lleva
+`pDestructor == zif_system` y uno de sus buckets contiene un `zval` de tipo
+`IS_STRING`, la llamada al destructor se convierte en `system(&bucket.val)`,
+y la cadena es el comando.**
+
+El punto exacto donde esto encaja está en `php_session_track_init()`
+(`ext/session/session.c`):
+
+```c
+if (!Z_ISUNDEF(PS(http_session_vars))) {
+    zval_ptr_dtor(&PS(http_session_vars));   /* destruye el array COLGANTE */
+}
+array_init(&session_vars);                   /* emalloc(56) */
+```
+
+**Lo que se midió en el binario instrumentado:** después del OOM, el array
+colgante **conserva** `pDestructor == zval_ptr_dtor` y `nTableSize == 8`.
+La corrupción es parcial: el refcount y los flags son basura, pero el puntero
+al destructor y el tamaño de la tabla sobreviven intactos.
+
+Eso define exactamente lo que falta:
+
+| Requisito | Estado |
+|---|---|
+| El `zend_array` liberado es de 56 bytes (bin 6) | ✅ medido |
+| La posición del slot en el pool es predecible | ✅ medido (elemento 14, paso 0x38) |
+| El siguiente allocation de 56 B lo reutiliza | ⚠️ 28,4 % por intento (LIFO, por páginas) |
+| El `pDestructor` del slot es `zif_system` | ❌ **sigue siendo `zval_ptr_dtor`** |
+| Un bucket `IS_STRING` con el comando | ❌ no alcanzado |
+
+**El requisito que bloquea la RCE es el cuarto.** Para lograrlo hacen falta
+dos cosas a la vez:
+
+1. Que un allocation de 56 bytes aterrice **exactamente** en el slot liberado.
+   Es un problema de control del allocator, y el 28,4 % por intento lo hace
+   alcanzable con varios intentos — pero con spray, no con control exacto.
+2. Que ese allocation escriba `zif_system` en el offset `0x30` del slot
+   manteniendo el resto de la estructura como una tabla hash válida con un
+   bucket `IS_STRING`.
+
+El punto 2 es el difícil, porque una `zend_array` forjada no puede llevar
+dentro el comando: 56 bytes no dan para más. El comando tiene que vivir en
+otro allocation —un `zend_string`— al que apunte el bucket.
+
+**Lo que NO se hizo y por qué no se afirma:** no se construyó un allocation
+de 56 bytes con contenido elegido por el atacante. El spray clásico de 288
+bytes de los writeups no sirve (§10.6), y en este trabajo no se	modeló un
+spray de 56 bytes con la precisión de puntero necesaria. La imagen
+`php2shell_rce_exploit.py` ejecuta el escenario real y reporta el estado del
+gadget en cada intento, de modo que el progreso es medible, pero **no
+produce ejecución de código**.
+
+### 10.12 Validación contra el advisory oficial (`GHSA-6wmf-4rv5-p3rp`)
+
+El 21 de octubre, el proyecto PHP publicó el advisory
+[`GHSA-6wmf-4rv5-p3rp`](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
+para CVE-2026-109619. Su descripción, textual:
+
+> PHP contains various global state, such as error, session, object and
+> extension state that is retained by a worker but points to memory owned by
+> one request. That state must be reset before the request memory is
+> released. […] A fatal error, **including one caused by memory exhaustion**,
+> can abandon an operation before it performs its matching reset. […] The
+> request heap is then freed while the **worker global field still refers to
+> it**. A later operation that runs before normal request initialization can
+> **consume the stale value**.
+
+Y el modelo abstracto que propone:
+
+> Successful exploitation of this vulnerability requires both a **producer**
+> and a **consumer**. The producer is a PHP operation that stores state owned
+> by one request in a location PHP can access later in a subsequent request.
+> The consumer is a subsequent PHP operation that reads, frees, branches or
+> otherwise acts on the stale state.
+
+**La medición de este trabajo es el caso concreto de sesión de ese modelo
+abstracto.** El mapping, punto por punto:
+
+| Advisory oficial (genérico) | Medición de este trabajo (caso `session.upload_progress`) |
+|---|---|
+| *state retained by a worker but points to memory owned by one request* | `PS(http_session_vars)` publicado en `php_session_track_init()` |
+| *a fatal error, including one caused by memory exhaustion* | `zend_bailout()` por `Allowed memory size … exhausted` |
+| *the request heap is then freed* | `shutdown_memory_manager()` se ejecuta igualmente |
+| *the worker global field still refers to it* | `PS(http_session_vars)` sigue apuntando al slot liberado |
+| *producer* | Request A (multipart + `PHP_SESSION_UPLOAD_PROGRESS` + file part) |
+| *consumer* | Request B (multipart + `PHP_SESSION_UPLOAD_PROGRESS` sin file part) |
+| *same worker* | Requirement confirmado: con `MaxRequestWorkers 1` el UAF es 6/6 |
+| *before normal request initialization* | `php_session_rfc1867_cleanup()` → `php_session_initialize()` en `MULTIPART_EVENT_END` |
+
+El advisory oficial describe **CVE-2026-109619** como *"remote code execution
+via stale request-owned global state reused by a later request on the same
+worker"*, y **CVE-2026-109618** como *"remote code execution via out-of-memory
+corruption during request cleanup"*. Las dos descripciones coinciden con lo
+que este trabajo midió por separado y con experimental controls.
+
+Esto tiene una consecuencia sobre la confianza en el resto del trabajo: la
+cadena OOM → `longjmp` → heap liberado → consumidor colgante **no es una
+hipótesis de este trabajo**, es la que el propio proyecto PHP describe. Lo
+que este trabajo añade es la **medición**: los controles A/B que aíslan el
+puntero responsable, las direcciones concretas, el tamaño real del slot y la
+explicación de por qué el spray clásico de la literatura no puede funcionar.
+
+### Nota: una cita que la literatura no hace bien
+
+La descripción de CVE-2026-109619 en el advisory es deliberadamente
+abstracta: habla de «global state» sin especificar la sesión. La rama
+`session.upload_progress` es **una** de las concreciones posibles del patrón
+— el advisory no la presenta como la única, y este trabajo tampoco lo afirma
+como exhaustividad del fallo. Lo que sí queda establecido es que la rama de
+sesión es explotable de forma reproducible en 8.2.34, y que su corrección
+requiere los parches 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12.
+
+---
+
 ## 11. Conclusiones para la defensa
 
 1. **El parche es la única respuesta completa.** Las mitigaciones por INI son parciales por diseño, y el advisory lo dice explícitamente.
@@ -1288,7 +1440,7 @@ asignación y cada liberación del bin 6.
    mecanismo correcto habría sido no publicar estado antes de que los módulos
    estén activados, o invalidar el estado en `php_request_shutdown()`.
 
-7. **PHP 7.4 es un agujero con los pies.** EOL sin parche para un RCE de 9.2 en el lenguaje más usado del mundo. Cualquier inventario de exposición debe tratarlo como prioritario.
+7. **PHP 7.4/8.0/8.1 son un agujero con los pies.** Fuera del ciclo regular de desarrollo para un RCE de 9.2 en el lenguaje más usado del mundo. PHP publicó backports mínimos de código fuente para estas ramas, así que la afirmación «EOL sin parche, vulnerable para siempre» sería inexacta: lo que falta es el ciclo regular de releases, y eso convierte la actualización en una dependencia de la distro o en trabajo manual. Cualquier inventario de exposición debe tratarlo como prioritario.
 
 8. **Para los que desconfían de lasPoC de terceros (con motivo).** Durante
    esta investigación se comprobó que parte de la literatura sobre estas CVEs
