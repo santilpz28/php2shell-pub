@@ -1,16 +1,16 @@
 #!/bin/bash
-# Publica el laboratorio PHP2Shell en github.com/santilpz28/php2shell-lab
+# Publica el laboratorio PHP2Shell en github.com/santilpz28/php2shell-pub
 #
 # Prerequisito: el repo DEBE existir (vacio) en GitHub. GitHub no permite
 # crear repos mediante push por SSH, y esta maquina no tiene ningun PAT
 # con permisos de API guardado.
 #
-#   https://github.com/new?name=php2shell-lab
+#   https://github.com/new?name=php2shell-pub
 #
 # Uso:  bash publish_github.sh
 set -euo pipefail
 
-REPO="git@github.com:santilpz28/php2shell-lab.git"
+REPO="git@github.com:santilpz28/php2shell-pub.git"
 STAGE="/tmp/php2shell-pub"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -27,7 +27,7 @@ cd "$STAGE"
 echo "→ Verificando que el repo remoto existe..."
 if ! git ls-remote "$REPO" >/dev/null 2>&1; then
     echo "❌ El repo remoto no existe o no es accesible."
-    echo "   Crealo aqui: https://github.com/new?name=php2shell-lab"
+    echo "   Crealo aqui: https://github.com/new?name=php2shell-pub"
     echo "   (sin inicializar README, .gitignore ni licencia)"
     exit 1
 fi
