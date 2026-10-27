@@ -22,6 +22,13 @@ Este disclaimer se añadió **al cierre del trabajo** para que nadie confunda
 resto del material haya sido modificado: el artículo, los PoC y los scripts se
 mantienen tal cual.
 
+> **Actualización posterior:** el artículo **sí** ha recibido una corrección
+> técnica posterior, documentada en §10.11-bis: se demostró que `zif_system`
+> **no** es un gadget válido, porque su firma real
+> (`void (zend_execute_data *, zval *)`) es incompatible con `dtor_func_t`
+> (`void (*)(zval *)`). Esa corrección afecta a la premisa del RCE, no al
+> mecanismo del UAF, que sigue verificado.
+
 ### Qué está verificado de extremo a extremo
 
 | Artefacto | Estado |
