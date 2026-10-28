@@ -26,7 +26,7 @@ php security cve rce use-after-free vulnerability-research heap chain-cortex
 
 ### LinkedIn (post largo)
 
-**Título:** PHP2Shell: dos CVEs de 9.2 en el núcleo de PHP. Tu aplicación puede ser perfecta y seguir siendo vulnerable.
+**Título:** PHP2Shell: dos CVEs de 9.2 en el núcleo de PHP. Y por qué "actualizar PHP" no siempre es la respuesta.
 
 **Cuerpo:**
 
@@ -85,9 +85,35 @@ php security cve rce use-after-free vulnerability-research heap chain-cortex
 >
 > **Lo que NO se logró, y lo decimos:** la RCE completa. No logramos reclamar el slot liberado con una `zend_array` forjada. Lo que sí quedó es que el bloqueo restante es **control del allocator**, no timing — y por qué el spray clásico no puede funcionar. Está todo documentado, con la evidencia.
 >
-> Publicamos el laboratorio completo: Docker reproducible, los dos parches idempotentes que instrumentan el propio PHP, un detector de exposición que discrimina vulnerable de parcheado **sin ejecutar exploits ni necesitar offsets**, y el artículo técnico con los controles A/B y el desensamblado.
+> Publicamos el laboratorio completo: Docker reproducible, los parches idempotentes que instrumentan el propio PHP, un detector de exposición que discrimina vulnerable de parcheado **sin ejecutar exploits ni necesitar offsets**, y el artículo técnico con los controles A/B y el desensamblado.
 >
 > → https://github.com/santilpz28/php2shell-pub
+>
+> ---
+>
+> **Y un apunte que se ha colado del debate público: "actualizar PHP" no siempre es la respuesta.**
+>
+> La reacción instintiva a un CVE de 9.2 es "actualiza a la última versión". Pero en flotas reales eso choca con extensiones PECL compiladas, con dependencias de plataforma y con años de customización. Y hay una cuarta vía que casi nadie menciona: **parchear el código conservando la versión**.
+>
+> Lo probamos. El parche oficial es un *commit* —"Avoid state corruption via bailout"— disponible como código fuente, no como binario. Aplicado sobre 8.2.34, sobre una versión que "sigue diciendo 8.2.34" y con las mismas extensiones compiladas:
+>
+> - El commit upstream de la rama 8.2 toca **423 ficheros** y reescribe el allocator de Zend MM: no es cherry-pickeable, genera conflictos en el núcleo del motor.
+> - Las ramas EOL (7.4, 8.0, 8.1) llevan **el mismo fix reducido a su forma mínima** (23 ficheros). Ese sí aplica sobre 8.2.34 con solo 3 conflictos en código, todos triviales.
+> - Uno de esos conflictos es una **redefinición de función que `git apply` no detecta** y que solo aparece al compilar. Lo documentamos entero, con el detalle de qué se resolvió y por qué.
+>
+> Resultado medido, tres targets, seis rondas cada uno:
+>
+> | Target | `php -v` | OOM | UAF | Veredicto |
+> |---|---|---|---|---|
+> | A | 8.2.34 | 6/6 | 6/6 | VULNERABLE |
+> | B | 8.2.35 | 0/6 | 0/6 | PARCHEADO |
+> | C | **8.2.34** | 0/6 | 0/6 | **PARCHEADO** |
+>
+> Mismo número de versión, mismas extensiones, mismo ABI. Solo el código corregido.
+>
+> La regla de oro: *parchea, no reescribas*. Y si no puedes ni parchear: `session.upload_progress.enabled=0`, `max_multipart_body_parts` y `max_file_uploads` acotados, y bloqueo de `multipart/form-data` en el servidor web.
+>
+> ⚠️ Con honestidad: el backport de las ramas EOL es una **mitigación mínima**, no el fix completo de upstream. Desactiva el callback de `session.upload_progress` de forma permanente — corta la cadena, pero también apaga el tracking de progreso de subidas. Es el trade-off de parchar sin poder actualizar.
 >
 > Si tu flota usa PHP 7.4/8.0/8.1, o no puedes actualizar en 48 h, hablemos: montamos un inventario de exposición con ese test diferencial. →
 >
@@ -136,7 +162,27 @@ zend_array forjada. Está documentado como tal, con la evidencia.
 el advisory oficial (GHSA-6wmf-4rv5-p3rp) describe exactamente este modelo
 abstracto — productor y consumidor, requests distintos, mismo worker.
 
-10/ Laboratorio completo: Docker reproducible, detector de exposición que
+10/ Y un apunte que se ha colado del debate público: "actualizar PHP" no
+siempre es la respuesta. El parche oficial es un COMMIT de código fuente,
+no un binario → se puede aplicar conservando versión, extensiones y ABI.
+
+11/ El commit upstream de 8.2 toca 423 ficheros y no es cherry-pickeable.
+Las ramas EOL (7.4/8.0/8.1) llevan el MISMO fix en 23 ficheros → ese sí
+aplica sobre 8.2.34 con solo 3 conflictos, todos triviales.
+
+12/ Medido, 3 targets × 6 rondas:
+A: 8.2.34 → OOM 6/6, UAF 6/6 → VULNERABLE
+B: 8.2.35 → OOM 0/6, UAF 0/6 → PARCHEADO
+C: 8.2.34 → OOM 0/6, UAF 0/6 → PARCHEADO
+
+Mismo `php -v` en A y C. Solo cambia el código.
+
+13/ Uno de los 3 conflictos es una REDEFINICIÓN DE FUNCIÓN que `git apply`
+NO detecta: el fallo solo aparece al compilar. Lo documentamos entero.
+
+Regla de oro: parchea, no reescribas.
+
+14/ Laboratorio completo: Docker reproducible, detector de exposición que
 discrimina vulnerable de parcheado SIN ejecutar exploits ni necesitar offsets.
 
 https://github.com/santilpz28/php2shell-pub
@@ -159,6 +205,7 @@ https://github.com/santilpz28/php2shell-pub
 > - **Impacto doble:** ejecución de comandos y lectura de memoria del proceso, lo que puede exponer datos de otros usuarios que compartan el worker (patrón Heartbleed).
 > - **PHP 7.4 / 8.0 / 8.1 están fuera del ciclo regular.** PHP publicó backports mínimos de código fuente, pero sin releases periódicas: la actualización depende de su distro.
 > - **Un WAF que mire el ritmo o el tamaño del body no lo frena.** La cadena es determinista; lo que sí la limita es el número de ficheros anidados.
+> - **Si no puedes actualizar de versión, se puede parchear conservando la versión.** El parche oficial es un commit de código fuente, no un binario: se puede aplicar sobre tu build manteniendo versión, extensiones y ABI. Lo verificamos (6/6 UAF en el sin parchear, 0/6 en el parcheado, con `php -v` idéntico).
 >
 > **Qué hacer:**
 >
@@ -166,7 +213,8 @@ https://github.com/santilpz28/php2shell-pub
 > 2. Actualizar a 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 y reiniciar todos los workers.
 > 3. Para 7.4 / 8.0 / 8.1: planificar migración o aplicar el backport de PHP.
 > 4. Si no puede actualizar de inmediato: `session.upload_progress.enabled=0` (mitigación oficial de PHP, con una cobertura parcial) y `max_multipart_body_parts` / `max_file_uploads` acotados.
-> 5. Revisar logs buscando `PHP_SESSION_UPLOAD_PROGRESS` en peticiones multipart y actividad anómala en `session.save_path`.
+> 5. Si no puede ni actualizar ni parchear: bloqueo de `multipart/form-data` en el servidor web.
+> 6. Revisar logs buscando `PHP_SESSION_UPLOAD_PROGRESS` en peticiones multipart y actividad anómala en `session.save_path`.
 >
 > **Propuesta Chain-Cortex:** auditoría de exposición PHP2Shell para su flota — inventario de versiones, verificación de exposición con test diferencial sobre servicios no-intrusivos, y validación de la remediación. El detector que usamos distingue vulnerable de parcheado sin necesidad de ejecutar exploits ni conocer offsets del binario.
 >

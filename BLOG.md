@@ -795,7 +795,226 @@ sudo systemctl restart apache2
 > - `pm.max_requests=1` rompe el requisito de mismo worker, útil como capa extra en FPM.
 > - No uses `RLIMIT_AS` / `RLIMIT_DATA`.
 
-### 8.3 Reglas WAF / detección
+### 8.3 La cuarta vía: parchear SIN cambiar de versión
+
+Actualizar PHP es lo correcto. Pero no siempre es posible: extensiones PECL
+compiladas contra una versión concreta, dependencias de plataforma, o
+certificaciones que fijan la pila. En ese caso existe una vía que casi
+nadie menciona: **parchear el código conservando la versión**.
+
+> La distinción importa. Una actualización cambia tres cosas a la vez: el
+> número de versión, las extensiones disponibles y el ABI. Un parche cambia
+> **solo el código**. Por eso un parche no rompe dependencias y una
+> actualización sí puede hacerlo.
+
+El parche oficial **es un commit de código fuente**, no un binario. Eso abre
+la puerta a aplicarlo sobre cualquier build.
+
+#### 8.3.1 Qué commits existen
+
+El fix se titula *"Avoid state corruption via bailout"* y aparece en
+**cuatro ramas** de `php/php-src`:
+
+| Commit | Rama | Ficheros | Alcance |
+|---|---|---|---|
+| `31c0ea7d7ff1d1fccb6492e52dab544011628065` | `PHP-8.2` (upstream) | **423** | Fix completo. Reescribe el allocator de Zend MM. Etiquetado `php-8.2.35`. |
+| `01a40e89fb…` | tag `php-8.2.35` | — | Cherry-pick del anterior. |
+| `3c832b523e…` | tag `php-8.3.36` | — | Ídem para 8.3. |
+| `506e87fa7d…` | tag `php-8.4.27` | — | Ídem para 8.4. |
+| `1d7dec178a094e6e75b229ce22754045f8c6070a` | `PHP-8.1-CVE-2026-109618-109619` | **23** | *"Minimal mitigation for EOL version."* |
+| `82f8f31b16a035c1b67cc253e79f7cc288f4cc20` | `PHP-8.0-CVE-2026-109618-109619` | 23 | Ídem. |
+| `712e60f9edfd03f0960fc4fc3c2c375f42b90aa2` | `PHP-7.4-CVE-2026-109618-109619` | 23 | Ídem. |
+
+Todos con el mismo mensaje:
+
+```
+Avoid state corruption via bailout
+
+Fix GHSA-w8hw-w9fx-j79w (CVE-2026-109618)
+Fix GHSA-6wmf-4rv5-p3rp (CVE-2026-109619)
+```
+
+> ⚠️ **Un falso positivo fácil.** En esas mismas ramas EOL hay otros dos
+> commits de Niels Dossche: `ed70b1ea` (*"Fix GHSA-www2-q4fc-65wf"*) y
+> `8b801151` (*"Fix GHSA-h96m-rvf9-jgm2"*). **No son los CVEs de
+> PHP2Shell** — son DNS rebinding y un null-deref de array. El commit que
+> nos interesa es el que menciona `GHSA-w8hw-w9fx-j79w` y
+> `GHSA-6wmf-4rv5-p3rp`.
+
+#### 8.3.2 Por qué el commit upstream no se puede backportar
+
+Probado con `git cherry-pick --no-commit 31c0ea7d7ff` sobre el tag
+`php-8.2.34`: conflictos de contenido en el **núcleo del motor**:
+
+```
+CONFLICT (content): Merge conflict in Zend/zend.c
+CONFLICT (content): Merge conflict in Zend/zend_alloc.c
+CONFLICT (content): Merge conflict in Zend/zend_alloc.h
+CONFLICT (content): Merge conflict in Zend/zend_attributes.c
+CONFLICT (content): Merge conflict in Zend/zend_builtin_functions.c
+CONFLICT (content): Merge conflict in Zend/zend_execute.c
+CONFLICT (content): Merge conflict in Zend/zend_hash.c
+…
+```
+
+El commit reescribe `Zend/zend_alloc.c` (651 líneas), `zend_hash.c`,
+`zend_string.c`, el VM, OPcache y una docena de extensiones. **No es un
+parche "drop-in".** Resolverlo a mano sobre un build de producción es
+exactamente el tipo de operación que no quieres hacer un viernes.
+
+#### 8.3.3 Por qué el commit de la rama EOL sí
+
+Las ramas sin soporte llevan **el mismo fix reducido a su forma mínima**,
+escrito explícitamente para ellas: 23 ficheros, de los cuales **5 son de
+código** y 18 son tests `.phpt`. Aplicado sobre `php-8.2.34` produce solo
+**3 conflictos en código real**:
+
+```
+CONFLICT: Zend/zend_alloc.c
+CONFLICT: ext/opcache/zend_file_cache.c
+CONFLICT: main/rfc1867.c
+CONFLICT: ext/zend_test/tests/observer_bug81430_2.phpt   ← solo test
+CONFLICT: ext/zend_test/tests/observer_error_01.phpt      ← solo test
+```
+
+Ninguno es irreversible. Y el resultado, verificado, es que el PHP parcheado
+**se comporta exactamente igual que el 8.2.35 oficial**.
+
+#### 8.3.4 Los tres conflictos y cómo se resolvieron
+
+**① `Zend/zend_alloc.c`** — dos OCC.
+
+*El include.* HEAD (8.2.34) tiene `#include "zend_mmap.h"`; el parche añade
+`#include "zend_execute.h"`. No son excluyentes: se conservan **ambos**.
+
+*La salida por OOM.* Aquí está el fondo del asunto:
+
+| | 8.2.34 (HEAD) | parche (rama EOL) |
+|---|---|---|
+| `zend_out_of_memory()` | `exit(1)` | `_exit(1)` |
+
+`exit(1)` ejecuta los handlers `atexit` → flush de buffers → **unwinding a
+través de la VM**. Ese unwinding es precisamente lo que corrompe el estado
+del allocator: deja punteros colgando en globals que sobreviven al worker.
+`_exit(1)` no ejecuta nada de eso.
+
+**Gana el parche.** Pero hay un detalle que no sale del `cherry-pick`:
+
+> 8.2.34 **ya define** `zend_out_of_memory()` (línea 2792, con `exit(1)`), y
+> el commit de la rama 8.1 la define también (línea 3112, con `_exit(1)`).
+> En la rama 8.1 no había definición previa, por eso el parche no genera
+> conflicto — **pero al aplicarlo sobre 8.2.34 se produce una
+> redefinición**, y el compilador falla con:
+>
+> ```
+> /…/Zend/zend_alloc.c:2820:37: error: redefinition of 'zend_out_of_memory'
+> ```
+>
+> Este **no es un conflicto textual**: `git apply` lo acepta sin quejarse y
+> el fallo solo aparece al compilar. Es el tipo de conflicto semántico que
+> sólo se ve al enlazar.
+
+Resolución: eliminar la definición de HEAD y conservar la del parche.
+
+**② `main/rfc1867.c`** — cosmético. 8.2.34 ya tenía aplicado el fix de
+seguridad de `isspace()` (cast a `unsigned char`); el parche mueve ese
+`do { value++; } while (isspace(...))` dentro del bloque nuevo de filtrado
+de cabeceras multipart. Se conserva el cast de HEAD.
+
+**③ `ext/opcache/zend_file_cache.c`** — HEAD usa `bool ok` (C99), el parche
+usa `int ok`. No son incompatibles. Se conserva `bool` de HEAD y se añade
+`size_t orig_map_ptr_last` del parche, que es **imprescindible**: guarda el
+valor original de `CG(map_ptr_last)` para poder restaurarlo si la
+deserialización falla (`zend_accel_pending_ce_cache_discard();
+CG(map_ptr_last) = orig_map_ptr_last;`). Es el mecanismo que evita que un
+fallo a mitad de carga del script deje el allocator de OPcache a medias.
+
+Los dos conflictos en tests `.phpt` se resuelven quedándose con HEAD: no
+afectan al binario.
+
+#### 8.3.5 Resultado medido
+
+Tercer target del laboratorio: **PHP 8.2.34 con el commit de parche aplicado
+y recompilado**. Mismo `php -v`, mismas extensiones, mismo ABI.
+
+| Target | `php -v` | Símbolo del parche | OOM | UAF consumido | Veredicto |
+|---|---|---|---|---|---|
+| `:8080` | 8.2.34 | 0 | **6/6** | **6/6** (3 SIGSEGV + 3 stale SID) | VULNERABLE |
+| `:8081` | 8.2.35 | 0 | 0/6 | 0/6 | PARCHEADO |
+| `:8082` | **8.2.34** | **3** | 0/6 | 0/6 | **PARCHEADO** |
+
+El indicador "símbolo del parche" es la presencia de `zend_mm_safe_error_ex`
+en `/usr/lib/apache2/modules/libphp.so` — la función nueva que introduce el
+commit. En la imagen base es 0; en la parcheada, 3.
+
+Las extensiones cargadas son idénticas en el target vulnerable y en el
+parcheado: `mbstring session sodium`.
+
+```bash
+# Construir el target parcheado
+docker build -f Dockerfile.backport -t php2shell-backport:8.2.34 .
+
+# Verificar el parche por código, sin mirar el número de versión
+python3 verify_backport.py --container php2shell-backport
+#   session_callback_disabled: True
+#   oom_uses_safe_error: True
+#   VEREDICTO: PATCHED
+```
+
+#### 8.3.6 Trampas de implementación
+
+Tres cosas que costaron tiempo y queanyone que quiera replicarlo va a
+tropezar:
+
+1. **La ruta de `mod_php`.** Un build con `--with-apxs2` deja `libphp.so` en
+   `$PREFIX/libs/`, pero la imagen oficial `php:*-apache` carga el módulo
+   desde **`/usr/lib/apache2/modules/libphp.so`** (convención Debian). Sin
+   sobreescribir ese path, **Apache sigue ejecutando el PHP sin parchear**
+   y el target "parcheado" se comporta como vulnerable. El síntoma es
+   silencioso: todo parece ir bien hasta que el test diferencial falla.
+2. **`opcache` es una Zend Extension**, no una extension normal. Cargarlo
+   con `extension=` falla con *"Invalid library (appears to be a Zend
+   Extension)"*. Necesita `zend_extension=opcache.so`.
+3. **Apache, no CLI.** El UAF exige que el estado colgante sobreviva entre
+   peticiones **en el mismo worker**. El servidor integrado `php -S` es
+   monoproceso y muere con el crash. Con `mpm_prefork` y
+   `MaxRequestWorkers 1` funciona.
+
+> 📄 El procedimiento completo, con los tres conflictos resueltos paso a paso,
+> está en [`patches/RESOLUTION-NOTES.md`](patches/RESOLUTION-NOTES.md), y el
+> script reproducible en [`patches/apply_backport.sh`](patches/apply_backport.sh).
+
+#### 8.3.7 Limitación honesta de esta vía
+
+El backport de la rama EOL es una **mitigación mínima**, no el fix completo de
+upstream. En concreto, desactiva el callback de `upload_progress` de forma
+permanente:
+
+```c
+-	if (!PS(rfc1867_enabled)) {
++	if (!PS(rfc1867_enabled) || true) {
+ 		return retval;
+ 	}
+```
+
+Eso corta la cadena de ataque (la rama CVE-2026-109619 necesita ese callback
+para consumir el estado de sesión colgante), pero **también desactiva una
+funcionalidad legítima**: el tracking de progreso de subidas. Si tu
+aplicación usa `session.upload_progress` para una barra de progreso, es un
+cambio de comportamiento observable.
+
+**Cuándo usar cada vía:**
+
+| Situación | Vía recomendada |
+|---|---|
+| PHP 8.2+ con capacidad de actualizar | **Actualizar** a 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. Es lo correcto. |
+| PHP 8.2+ que no puede cambiar de versión (deps, extensiones PECL, ABI) | **Backport del commit** (esta sección). |
+| PHP 7.4 / 8.0 / 8.1 | **Paquete parcheado de la distro** (Sury, Remi, AlmaLinux…) o backport equivalente. |
+| No se puede tocar PHP ahora | Mitigaciones: `session.upload_progress.enabled=0`, `max_multipart_body_parts`, `max_file_uploads`, bloqueo de `multipart/form-data` en el web server. |
+
+La regla de oro: **parchea, no reescribas**.
+
+### 8.4 Reglas WAF / detección
 
 Akamai publicó la regla **3000991 v1** ("PHP Remote Code Execution Attack Detected") para sus clientes de App & API Protector, y confirma que sus reglas existentes de command injection ya mitigan los payloads weaponizados.
 
@@ -815,7 +1034,7 @@ Indicadores clave para reglas propias:
   Session ID is too long or contains illegal characters`.
 - Fields `t[]` con valores de tamaño anómalo (≈288 bytes) y alta densidad de repeticiones (mecanismo de spray descrito en la literatura pública).
 
-### 8.4 Post-explotación — qué buscar
+### 8.5 Post-explotación — qué buscar
 
 Si un servidor estuvo expuesto:
 

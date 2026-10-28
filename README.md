@@ -37,6 +37,7 @@ mantienen tal cual.
 | Lectura y contraste del parche oficial `31c0ea7d7ff` | ✅ Verificado directamente |
 | Layout de `zend_internal_function` (size=136, `handler` en offset 72) | ✅ Verificado con programa `offsetof` contra `Zend/zend_compile.h` |
 | Test diferencial vulnerable/parcheado (`behavioural_diff.py`) | ✅ Ejecutado contra 8.2.34 y 8.2.35 reales |
+| Backport del commit de parche sobre 8.2.34 (sin cambio de versión) | ✅ Compilado y ejecutado: **6/6 UAF en el sin parchear, 0/6 en el parcheado**, con `php -v` idéntico |
 | Mecanismo del UAF con direcciones reales y tamaño del slot | ✅ Medido en el binario instrumentado |
 | Tamaño del `zend_array` liberado (56 B, bin 6) y posición en el pool (elemento 14, paso 0x38) | ✅ Medido |
 | Reutilización del slot liberado por el siguiente allocation de 56 B | ⚠️ 28,4 % por intento (LIFO, por páginas) |
@@ -203,10 +204,14 @@ ni de precisión, ni de ASLR: es un problema de **clase de tamaño**.
 |---|---|
 | `check_exposure.sh` | Sonda de exposición de una pasada. `exit 1` = vulnerable, `exit 0` = parcheado |
 | `behavioural_diff.py` | Test diferencial vulnerable/parcheado con controles A/B |
+| `verify_backport.py` | Verifica si un PHP lleva el parche aplicado **independientemente de su número de versión** (por código y/o comportamiento) |
 | `php2shell_leak.py` | Detector del UAF con controles negativos |
 | `php2shell_rce.py` | Andamiaje de la escalada: monta el escenario real y recoge la traza. **⚠️ En desarrollo — la cadena completa de RCE no se reprodujo de extremo a extremo (ver disclaimer arriba).** |
 | `php2shell_rce_exploit.py` | Ejecuta el escenario real y reporta el estado del gadget por intento. **⚠️ No produce ejecución de código (ver disclaimer arriba).** |
 | `patches/` | Parches idempotentes que instrumentan el propio PHP (sesión + allocator) |
+| `patches/apply_backport.sh` | Aplica el parche oficial sobre 8.2.34 **sin cambiar de versión** y recompila |
+| `patches/php-8.2.34-backport-bailout.patch` | El parche ya resuelto, listo para `git apply` sobre el tag `php-8.2.34` |
+| `patches/RESOLUTION-NOTES.md` | Detalle de los 3 conflictos del backport y de por qué se resolvieron así |
 | `web/` | Endpoints del laboratorio |
 
 ### Inicio rápido
@@ -242,6 +247,43 @@ docker exec php2shell-trace cat /tmp/php2shell_alloc.log   # allocator
 Los parches se aplican **antes de compilar** y son idempotentes: el target es
 reproducible desde cero. Detalles en [`NOTES-alloc-trace.md`](NOTES-alloc-trace.md).
 
+### Third target: parcheado SIN cambiar de versión
+
+Los dos targets anteriores se construyen asi:
+
+| Target | Versión | Como se obtiene |
+|---|---|---|
+| `php2shell-vuln:8.2.34` | 8.2.34 | `docker build -f Dockerfile -t php2shell-vuln:8.2.34 .` |
+| `php2shell-patched:8.2.35` | 8.2.35 | `docker build -f Dockerfile.patched -t php2shell-patched:8.2.35 .` |
+| `php2shell-backport:8.2.34` | **8.2.34** | `docker build -f Dockerfile.backport -t php2shell-backport:8.2.34 .` |
+
+El tercero es el interesante: **mismo número de versión que el vulnerable,
+mismas extensiones, mismo ABI. Solo cambia el código.** El parche oficial
+("Avoid state corruption via bailout", `31c0ea7d7ff`) se aplica sobre el
+árbol de fuentes de 8.2.34 y se recompila.
+
+```bash
+docker compose up -d
+python3 behavioural_diff.py 127.0.0.1 8080 "8.2.34 SIN parche"
+python3 behavioural_diff.py 127.0.0.1 8081 "8.2.35 oficial"
+python3 behavioural_diff.py 127.0.0.1 8082 "8.2.34 + backport"
+
+# Verificar la huella del parche sin mirar el número de versión
+python3 verify_backport.py --container php2shell-backport
+```
+
+Resultado medido (6 rondas por target, evidencia en `evidence/backport/`):
+
+| Target | Versión `php -v` | OOM | UAF consumido | Veredicto |
+|---|---|---|---|---|
+| `:8080` | 8.2.34 | **6/6** | **6/6** (3 SIGSEGV + 3 stale SID) | VULNERABLE |
+| `:8081` | 8.2.35 | 0/6 | 0/6 | PARCHEADO |
+| `:8082` | **8.2.34** | 0/6 | 0/6 | **PARCHEADO** |
+
+El backport produce el mismo comportamiento que el 8.2.35 oficial sin tocar
+el número de versión. Detalle de los conflictos y del procedimiento, en
+[`patches/RESOLUTION-NOTES.md`](patches/RESOLUTION-NOTES.md).
+
 ---
 
 ## Remedios
@@ -252,6 +294,39 @@ parciales por diseño.
 | Versión parcheada | 8.2.35 · 8.3.36 · 8.4.27 · 8.5.12 |
 |---|---|
 | **PHP 7.4 / 8.0 / 8.1** | Fuera de soporte del proyecto PHP, pero **PHP ha publicado backports mínimos de código fuente**. Actualiza al paquete de tu distro o a un backport, no a una versión EOL tal cual. |
+
+### Y si no puedes actualizar de versión
+
+Actualizar PHP es lo correcto, pero no siempre es posible: extensiones PECL
+compiladas contra una versión concreta, dependencias de plataforma, o
+certificaciones que fijan la pila. En ese caso existe una cuarta vía:
+**parchear el código conservando la versión.**
+
+El parche oficial es un *commit* (`31c0ea7d7ff`, "Avoid state corruption via
+bailout"), no un binario. Aplicado sobre 8.2.34:
+
+- El commit **upstream** de la rama 8.2 toca 423 ficheros y reescribe el
+  allocator de Zend MM: no es cherry-pickeable sobre 8.2.34 (conflictos en
+  el núcleo del motor).
+- Las ramas **EOL** (7.4, 8.0, 8.1) llevan **el mismo fix reducido a su forma
+  mínima** (23 ficheros). Ese sí aplica sobre 8.2.34 con solo 3 conflictos en
+  código, todos triviales.
+
+```bash
+docker build -f Dockerfile.backport -t php2shell-backport:8.2.34 .
+python3 verify_backport.py --container php2shell-backport   # → PATCHED
+```
+
+El resultado: **mismo `php -v`, mismas extensiones, mismo ABI.** Es la
+diferencia entre *parchear* y *reescribir*.
+
+> ⚠️ **Limitación honesta.** El backport de la rama EOL es una **mitigación
+> mínima**, no el fix completo de upstream. Desactiva el callback de
+> `session.upload_progress` de forma permanente: eso corta la cadena de
+> ataque, pero también **desactiva una funcionalidad legítima** (el tracking
+> de progreso de uploads). Si tu aplicación lo usa, eso es un cambio de
+> comportamiento observable. Procedimiento y detalle de los conflictos:
+> [`patches/RESOLUTION-NOTES.md`](patches/RESOLUTION-NOTES.md).
 
 > ⚠️ **Corrección (27-oct-2026, 23:20):** versiones anteriores de este README
 > afirmaban que PHP 7.4 quedaría «vulnerable para siempre». **Es incorrecto**:
@@ -293,7 +368,8 @@ pm.max_requests = 1        ; rompe el requisito de "mismo worker" (solo FPM)
 ## Sobre la reproducción
 
 - Todo el trabajo se ha hecho contra **contenedores Docker locales**.
-- Los targets usan PHP 8.2.34 (vulnerable) y 8.2.35 (parcheado).
+- Los targets usan PHP 8.2.34 (vulnerable), 8.2.35 (parcheado por upgrade) y
+  8.2.34 + backport del commit de parche (parcheado sin upgrade).
 - El target instrumentado se compila desde el código fuente de PHP con
   `Dockerfile.trace`; tarda ~20 min (el build **no** usa `-j` a propósito: con
   `-j` el enlazador de `libphp.so` consume >2 GB y el build muere con OOM).
