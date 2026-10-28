@@ -790,7 +790,229 @@ sudo systemctl restart apache2
 > - `pm.max_requests=1` breaks the same-worker requirement, useful as an extra layer under FPM.
 > - Do not use `RLIMIT_AS` / `RLIMIT_DATA`.
 
-### 8.3 WAF rules / detection
+### 8.3 The fourth path: patching WITHOUT changing the version
+
+Updating PHP is the right thing to do. But it is not always possible: PECL
+extensions compiled against a specific version, platform dependencies, or
+certifications that pin the stack. In that case there is a route almost
+nobody mentions: **patching the code while keeping the version**.
+
+> The distinction matters. An update changes three things at once: the
+> version number, the available extensions and the ABI. A patch changes
+> **only the code**. That is why a patch does not break dependencies and an
+> update can.
+
+The official patch **is a source code commit**, not a binary. That opens the
+door to applying it on top of any build.
+
+#### 8.3.1 Which commits exist
+
+The fix is titled *"Avoid state corruption via bailout"* and appears in
+**four branches** of `php/php-src`:
+
+| Commit | Branch | Files | Scope |
+|---|---|---|---|
+| `31c0ea7d7ff1d1fccb6492e52dab544011628065` | `PHP-8.2` (upstream) | **423** | Full fix. Rewrites the Zend MM allocator. Tagged `php-8.2.35`. |
+| `01a40e89fb…` | tag `php-8.2.35` | — | Cherry-pick of the above. |
+| `3c832b523e…` | tag `php-8.3.36` | — | Same for 8.3. |
+| `506e87fa7d…` | tag `php-8.4.27` | — | Same for 8.4. |
+| `1d7dec178a094e6e75b229ce22754045f8c6070a` | `PHP-8.1-CVE-2026-109618-109619` | **23** | *"Minimal mitigation for EOL version."* |
+| `82f8f31b16a035c1b67cc253e79f7cc288f4cc20` | `PHP-8.0-CVE-2026-109618-109619` | 23 | Same. |
+| `712e60f9edfd03f0960fc4fc3c2c375f42b90aa2` | `PHP-7.4-CVE-2026-109618-109619` | 23 | Same. |
+
+All with the same message:
+
+```
+Avoid state corruption via bailout
+
+Fix GHSA-w8hw-w9fx-j79w (CVE-2026-109618)
+Fix GHSA-6wmf-4rv5-p3rp (CVE-2026-109619)
+```
+
+> ⚠️ **An easy false positive.** In those same EOL branches there are two
+> other commits by Niels Dossche: `ed70b1ea` (*"Fix GHSA-www2-q4fc-65wf"*) and
+> `8b801151` (*"Fix GHSA-h96m-rvf9-jgm2"*). **They are not the PHP2Shell
+> CVEs** — they are DNS rebinding and an array null-deref. The commit we
+> care about is the one mentioning `GHSA-w8hw-w9fx-j79w` and
+> `GHSA-6wmf-4rv5-p3rp`.
+
+#### 8.3.2 Why the upstream commit cannot be backported
+
+Tested with `git cherry-pick --no-commit 31c0ea7d7ff` on top of the
+`php-8.2.34` tag: content conflicts in the **core of the engine**:
+
+```
+CONFLICT (content): Merge conflict in Zend/zend.c
+CONFLICT (content): Merge conflict in Zend/zend_alloc.c
+CONFLICT (content): Merge conflict in Zend/zend_alloc.h
+CONFLICT (content): Merge conflict in Zend/zend_attributes.c
+CONFLICT (content): Merge conflict in Zend/zend_builtin_functions.c
+CONFLICT (content): Merge conflict in Zend/zend_execute.c
+CONFLICT (content): Merge conflict in Zend/zend_hash.c
+…
+```
+
+The commit rewrites `Zend/zend_alloc.c` (651 lines), `zend_hash.c`,
+`zend_string.c`, the VM, OPcache and a dozen extensions. **It is not a
+"drop-in" patch.** Resolving it by hand on a production build is exactly the
+kind of operation you do not want to attempt on a Friday.
+
+#### 8.3.3 Why the EOL branch commit does work
+
+The unsupported branches carry **the same fix reduced to its minimal form**,
+written explicitly for them: 23 files, of which **5 are code** and 18 are
+`.phpt` tests. Applied on top of `php-8.2.34` it produces only **3 conflicts
+in real code**:
+
+```
+CONFLICT: Zend/zend_alloc.c
+CONFLICT: ext/opcache/zend_file_cache.c
+CONFLICT: main/rfc1867.c
+CONFLICT: ext/zend_test/tests/observer_bug81430_2.phpt   ← test only
+CONFLICT: ext/zend_test/tests/observer_error_01.phpt      ← test only
+```
+
+None of them is irreversible. And the verified result is that the patched
+PHP **behaves exactly like the official 8.2.35**.
+
+#### 8.3.4 The three conflicts and how they were resolved
+
+**① `Zend/zend_alloc.c`** — two OCC.
+
+*The include.* HEAD (8.2.34) has `#include "zend_mmap.h"`; the patch adds
+`#include "zend_execute.h"`. They are not mutually exclusive: **both are
+kept**.
+
+*The OOM exit.* This is where the substance is:
+
+| | 8.2.34 (HEAD) | patch (EOL branch) |
+|---|---|---|
+| `zend_out_of_memory()` | `exit(1)` | `_exit(1)` |
+
+`exit(1)` runs the `atexit` handlers → flushes buffers → **unwinds through
+the VM**. That unwinding is precisely what corrupts the allocator state: it
+leaves dangling pointers in globals that outlive the worker. `_exit(1)` does
+none of that.
+
+**The patch wins.** But there is a detail that does not surface during the
+`cherry-pick`:
+
+> 8.2.34 **already defines** `zend_out_of_memory()` (line 2792, with `exit(1)`),
+> and the 8.1 branch commit defines it too (line 3112, with `_exit(1)`).
+> On the 8.1 branch there was no prior definition, which is why the patch
+> generates no conflict — **but applying it on top of 8.2.34 produces a
+> redefinition**, and the compiler fails with:
+>
+> ```
+> /…/Zend/zend_alloc.c:2820:37: error: redefinition of 'zend_out_of_memory'
+> ```
+>
+> This **is not a textual conflict**: `git apply` accepts it without
+> complaint and the failure only shows up at compile time. It is the kind of
+> semantic conflict you only see at link time.
+
+Resolution: drop the HEAD definition and keep the patch's.
+
+**② `main/rfc1867.c`** — cosmetic. 8.2.34 already had the `isspace()`
+security fix applied (cast to `unsigned char`); the patch moves that
+`do { value++; } while (isspace(...))` into the new multipart header
+filtering block. The HEAD cast is kept.
+
+**③ `ext/opcache/zend_file_cache.c`** — HEAD uses `bool ok` (C99), the patch
+uses `int ok`. They are not incompatible. `bool` from HEAD is kept and
+`size_t orig_map_ptr_last` from the patch is added, which is
+**indispensable**: it stores the original value of `CG(map_ptr_last)` so it
+can be restored if deserialization fails
+(`zend_accel_pending_ce_cache_discard();
+CG(map_ptr_last) = orig_map_ptr_last;`). It is the mechanism that prevents a
+failure halfway through script loading from leaving the OPcache allocator in
+a half-configured state.
+
+The two conflicts in `.phpt` test files are resolved by keeping HEAD: they
+do not affect the binary.
+
+#### 8.3.5 Measured result
+
+Third target of the laboratory: **PHP 8.2.34 with the patch commit applied
+and recompiled**. Same `php -v`, same extensions, same ABI.
+
+| Target | `php -v` | Patch symbol | OOM | UAF consumed | Verdict |
+|---|---|---|---|---|---|
+| `:8080` | 8.2.34 | 0 | **6/6** | **6/6** (3 SIGSEGV + 3 stale SID) | VULNERABLE |
+| `:8081` | 8.2.35 | 0 | 0/6 | 0/6 | PATCHED |
+| `:8082` | **8.2.34** | **3** | 0/6 | 0/6 | **PATCHED** |
+
+The "patch symbol" indicator is the presence of `zend_mm_safe_error_ex` in
+`/usr/lib/apache2/modules/libphp.so` — the new function the commit
+introduces. In the base image it is 0; in the patched one, 3.
+
+The loaded extensions are identical in the vulnerable and the patched
+target: `mbstring session sodium`.
+
+```bash
+# Build the patched target
+docker build -f Dockerfile.backport -t php2shell-backport:8.2.34 .
+
+# Verify the patch by code, without looking at the version number
+python3 verify_backport.py --container php2shell-backport
+#   session_callback_disabled: True
+#   oom_uses_safe_error: True
+#   VERDICT: PATCHED
+```
+
+#### 8.3.6 Implementation traps
+
+Three things that cost time and that anyone trying to replicate this will
+trip over:
+
+1. **The `mod_php` path.** A build with `--with-apxs2` leaves `libphp.so` in
+   `$PREFIX/libs/`, but the official `php:*-apache` image loads the module
+   from **`/usr/lib/apache2/modules/libphp.so`** (Debian convention).
+   Without overwriting that path, **Apache keeps running the unpatched
+   PHP** and the "patched" target behaves like a vulnerable one. The symptom
+   is silent: everything looks fine until the differential test fails.
+2. **`opcache` is a Zend Extension**, not a regular extension. Loading it
+   with `extension=` fails with *"Invalid library (appears to be a Zend
+   Extension)"*. It needs `zend_extension=opcache.so`.
+3. **Apache, not CLI.** The UAF requires the dangling state to survive
+   between requests **in the same worker**. The built-in `php -S` server is
+   single-process and dies with the crash. With `mpm_prefork` and
+   `MaxRequestWorkers 1` it works.
+
+> 📄 The full procedure, with the three conflicts resolved step by step, is in
+> [`patches/RESOLUTION-NOTES.md`](patches/RESOLUTION-NOTES.md), and the
+> reproducible script in [`patches/apply_backport.sh`](patches/apply_backport.sh).
+
+#### 8.3.7 The honest limitation of this path
+
+The EOL branch backport is a **minimal mitigation**, not the full upstream
+fix. Specifically, it permanently disables the `upload_progress` callback:
+
+```c
+-	if (!PS(rfc1867_enabled)) {
++	if (!PS(rfc1867_enabled) || true) {
+ 		return retval;
+ 	}
+```
+
+That cuts the attack chain (the CVE-2026-109619 branch needs that callback
+to consume the dangling session state), but it **also disables a legitimate
+feature**: upload progress tracking. If your application uses
+`session.upload_progress` for a progress bar, this is an observable
+behaviour change.
+
+**When to use each path:**
+
+| Situation | Recommended path |
+|---|---|
+| PHP 8.2+ with the ability to update | **Update** to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. It is the right thing to do. |
+| PHP 8.2+ that cannot change version (deps, PECL extensions, ABI) | **Backport the commit** (this section). |
+| PHP 7.4 / 8.0 / 8.1 | **Distro patched package** (Sury, Remi, AlmaLinux…) or equivalent backport. |
+| PHP cannot be touched right now | Mitigations: `session.upload_progress.enabled=0`, `max_multipart_body_parts`, `max_file_uploads`, blocking `multipart/form-data` at the web server. |
+
+The golden rule: **patch, do not rewrite**.
+
+### 8.4 WAF rules / detection
 
 Akamai published rule **3000991 v1** ("PHP Remote Code Execution Attack Detected") for its App & API Protector customers, and confirms that its existing command injection rules already mitigate the weaponized payloads.
 
@@ -810,7 +1032,7 @@ Key indicators for custom rules:
   Session ID is too long or contains illegal characters`.
 - `t[]` fields with anomalous size values (≈288 bytes) and high repetition density (spray mechanism described in the public literature).
 
-### 8.4 Post-exploitation — what to look for
+### 8.5 Post-exploitation — what to look for
 
 If a server was exposed:
 
@@ -1010,7 +1232,7 @@ The values of the freed state are the classic signature:
 | `flags` | `0x8` | `0x0` | flags stomped by the reassignment |
 | `nNumUsed` | 0 | 1 | reused bucket |
 | `nTableSize` | 8 | 8 | survives: that is why the crash is late |
-| `pDestructor` | `zval_ptr_dtor` | `zval_ptr_dtor` | survives intact |
+| `pDestructor` | `zval_ptr_dtor` | `arr + 0x50` | **garbage** (see §10.11-ter) |
 
 That `nTableSize` and `pDestructor` survive intact explains the failure
 window: the corruption is not total. The `gc.refcount` blown up to
@@ -1398,9 +1620,13 @@ if (ht->nNumUsed) {                              /* <- only if there are buckets
 }
 ```
 
-In the measured dangling array, `nNumUsed = 0`: the `pDestructor` **never
-gets invoked** and the crash comes from corrupted `arData`. Forging the
-gadget must additionally produce an array with at least one occupied bucket.
+In the measured dangling array, the `pDestructor` **never gets invoked** and
+the crash comes from corrupted `arData`. The raw dump (§10.11-ter) shows
+`nNumUsed = 1` at the moment `php_session_rfc1867_cleanup()` reads the
+array, but `arData` holds `arr + 0x30` — self-referential garbage — so the
+bucket table is not addressable and the destructor is never reached
+through it. Forging the gadget must additionally produce an array with at
+least one occupied bucket **and** a valid `arData` pointing at it.
 
 The exact point where this fits is in `php_session_track_init()`
 (`ext/session/session.c`):
@@ -1413,7 +1639,10 @@ array_init(&session_vars);                   /* emalloc(56) */
 ```
 
 **What was measured in the instrumented binary:** after the OOM, the dangling
-array **preserves** `pDestructor == zval_ptr_dtor` and `nTableSize == 8`.
+array keeps `nTableSize == 8` and the first 48 bytes standing, but
+**`pDestructor` does NOT preserve `zval_ptr_dtor`**: the raw memory dump
+(§10.11-ter) shows it holds `arr + 0x50`, i.e. self-referential garbage.
+The same happens with `arData`, which holds `arr + 0x30`.
 The corruption is partial: the refcount and the flags are garbage, but the
 pointer to the destructor and the table size survive intact.
 
@@ -1427,7 +1656,8 @@ That defines exactly what is missing:
 | The slot's `pDestructor` is an invocable gadget | ❌ **it is still `zval_ptr_dtor`** |
 | The gadget has a `void f(void *)` compatible signature | ⚠️ **`zif_system` is NOT** (two-argument signature) |
 | An `IS_STRING` bucket with the command | ❌ not reached |
-| The dangling array has `nNumUsed >= 1` | ❌ measured `nNumUsed = 0` (the `pDestructor` is not even invoked) |
+| The dangling array has `nNumUsed >= 1` | ✅ measured `nNumUsed = 1` in the raw dump |
+| The slot's `arData` points to a valid bucket table | ❌ **it holds `arr + 0x30` (self-referential garbage)** |
 
 **The requirements that block the RCE are the fourth, the fifth and the
 seventh.** Three things are needed at once:
@@ -1455,7 +1685,8 @@ the 56-byte slot. In the *packed* path it is `&arPacked[i]`, and `arPacked`
 is not the 56-byte slot either. That is: the `zend_array` (56 B) and the
 buckets (32 B) are separate allocations, which changes the spray strategy
 entirely relative to what the writeups assume.
-| The dangling array has `nNumUsed >= 1` | ❌ measured `nNumUsed = 0` (the `pDestructor` is not even invoked) |
+| The dangling array has `nNumUsed >= 1` | ✅ measured `nNumUsed = 1` in the raw dump; but `arData` is garbage, so the bucket is not addressable |
+| The slot's `arData` points to a valid bucket table | ❌ **it holds `arr + 0x30` (self-referential garbage)** |
 
 **The requirements that block the RCE are the fourth, the fifth and the
 seventh.** Three things are needed at once:
@@ -1491,6 +1722,98 @@ required pointer precision was not modelled. The
 `php2shell_rce_exploit.py` image executes the real scenario and reports the
 state of the gadget on every attempt, so progress is measurable, but it
 **does not produce code execution**.
+
+### 10.11-ter The raw dump: why the `pDestructor` does NOT survive
+
+The previous section took for granted that the `pDestructor` of the dangling
+array was still `zval_ptr_dtor`. In order to check it instead of assuming it,
+`php_session_rfc1867_cleanup()` was instrumented with a dump of the 8 raw
+bytes of the `zend_array` at the exact instant it is read.
+
+**Method.** In the `CLEANUP` trace block the following was added:
+
+```c
+unsigned long *w = (unsigned long *)arr;
+for (int i = 0; i < 8; i++) {
+    fprintf(pf, "  +0x%02zx = 0x%016lx\n", (unsigned)(i*8), (unsigned long)w[i]);
+}
+```
+
+The module was compiled and loaded with `MaxRequestWorkers 1` (same mandatory
+worker) and ASLR active, reading the base of the mapping from
+`/proc/<pid>/maps` in order to resolve the symbols.
+
+**Result (real run, raw logs in `evidence/`):**
+
+```
+PEEK2 arr=0x728fa6655310 ps_vars=0x728fa5823760
+  +0x00 = 0x0000000700000001
+  +0x08 = 0xfffffff000000000
+  +0x10 = 0x0000728fa6655340
+  +0x18 = 0x0000000100000001
+  +0x20 = 0x0000000000000008
+  +0x28 = 0x8000000000000000
+  +0x30 = 0x0000728fa6655360
+  +0x38 = 0x0000728fa6655380
+```
+
+With base `0x728fa4a87000`:
+
+- `zval_ptr_dtor` → `0x728fa4e60950` (offset `0x3d9950`)
+- `zif_system` → `0x728fa4d94560` (offset `0x30d560`)
+
+**Field-by-field interpretation:**
+
+| Offset | Field | Observed value | Reading |
+|---|---|---|---|
+| 0x00 | `gc.refcount` | 1 | intact |
+| 0x08 | `u.flags` | 0x07 | intact |
+| 0x0C | `nTableMask` | 0xfffffff0 | intact |
+| 0x10 | **`arData`** | **`arr + 0x30`** | **self-referential garbage** |
+| 0x18 | `nNumUsed` / `nNumOfElements` | 1 / 1 | intact |
+| 0x20 | `nTableSize` | 8 | intact |
+| 0x28 | `nNextFreeElement` | 0x8000000000000000 | intact |
+| 0x30 | **`pDestructor`** | **`arr + 0x50`** | **garbage, NOT `zval_ptr_dtor`** |
+| 0x38 | (outside the array) | `arr + 0x70` | — |
+
+**What this corrects.** The `pDestructor` of the dangling array is **not**
+`zval_ptr_dtor` nor any other function: it is a pointer that points to
+`arr + 0x50`, that is, to a field of the array itself. And `arData` —the
+pointer to the bucket table— equals `arr + 0x30`, also garbage.
+
+This is the signature of a **reused** slot: the allocator colonized the
+56-byte block with a pattern of self-referential pointers. The
+`arr+0x30` / `arr+0x50` / `arr+0x70` pattern is a regular progression with a
+`0x20` step, typical of an allocator that chains free blocks.
+
+**Consequence for the RCE — it is worse than was supposed.** The previous
+hypothesis was "the `pDestructor` survives, it is only necessary to replace it
+with `zif_system`". The measured reality is that:
+
+1. The `pDestructor` field has to be **rebuilt** entirely, not replaced.
+2. The `arData` field is also garbage: without a valid bucket table there is
+   no `zval` to which to pass the command, so
+   `ht->pDestructor(&p->val)` has nowhere to read the command from.
+3. That is to say: **a single 8-byte write into the slot is not enough.** It
+   is necessary that a 56-byte allocation lands in that exact position *and*
+   that it has the correct content at offsets `0x10` and `0x30` at the same
+   time.
+
+This **confirms** the size-class diagnosis (bin 6) and **reinforces** the
+conclusion that the classic 288 B spray of the writeups cannot serve: neither
+by size class, nor by content.
+
+**The point that remains open:** is it possible that a 56 B allocation with
+attacker-chosen content lands in that slot with a 28.4 % probability per
+attempt? That is the question that remains open, and the answer is what
+separates this investigation from a functional exploit.
+
+**Methodological note.** This finding is the main argument for
+instrumenting the binary instead of reasoning about the code: the inference
+"the pointer to the destructor survives" was plausible, well-reasoned,
+consistent with the model of the official advisory — and **false**. The 64-byte
+dump refuted it in one minute. A reader who trusted the reading of the
+article instead of the dump would have built the PoC on a broken premise.
 
 ### 10.12 Validation against the official advisory (`GHSA-6wmf-4rv5-p3rp`)
 
@@ -1692,7 +2015,7 @@ And against the patched target (8081), the same detector must not observe
 | That injection into the session file is possible | The upload's `filename` is stored literally in the session file (verified by reading `/tmp/sess_*`) |
 | That the actual RCE mechanism uses a hash table with `pDestructor`, not a `zend_internal_function` | Reading the PHP source code: `zend_array_destroy` invokes `ht->pDestructor` with a `zval*`, consistent with `dtor_func_t` (`void (*)(zval *)`) |
 | That **`zif_system` is NOT a valid gadget** (later correction) | Reading the core macros: `ZEND_FUNCTION` expands to `void (zend_execute_data *, zval *)` (`Zend/zend_API.h:71`, `Zend/zend.h:49`) — a **two**-argument signature incompatible with `dtor_func_t`. `php_exec_ex` takes the command from the `execute_data` (`ext/standard/exec.c:206`), not from the pointer received. **This point corrects the original premise of this article and of the writeups that replicate it** |
-| That the custom `pDestructor` is only invoked when there are buckets | Reading `zend_array_destroy` (`Zend/zend_hash.c:1755-1760`): `if (ht->nNumUsed) { if (ht->pDestructor != ZVAL_PTR_DTOR) ... }`. Measured: the dangling array has `nNumUsed = 0` |
+| That the custom `pDestructor` is only invoked when there are buckets | Reading `zend_array_destroy` (`Zend/zend_hash.c:1755-1760`): `if (ht->nNumUsed) { if (ht->pDestructor != ZVAL_PTR_DTOR) ... }`. Measured in the raw dump: `nNumUsed = 1`, but `arData` is garbage |
 | That Zend MM's allocator uses a per-bin LIFO free list | Reading `zend_mm_free_small` / `zend_mm_alloc_small` (`Zend/zend_alloc.c:1300-1338`): the freed slot is pushed onto the head of `free_slot[bin]` and the allocation takes it from the head. Measured in the trace: `FREE_SMALL 0x...41c0` followed by `ALLOC_SMALL 0x...41c0` |
 | The real layout of `zend_array` (`pDestructor` at 0x30) and of the candidate structures | An `offsetof` program compiled against the real PHP 8.2.34 headers: `zend_array` 56 B (`pDestructor` 0x30), `zend_object` 56 B, `Bucket` 32 B (`val` 0x00), `zval` 16 B, `zend_string` 32 B (`val` 0x18) |
 | That the crash **does not depend** on Request B's `PHPSESSID` | A/B control: Request B with identical SID (crash 4/4) vs different SID (crash 4/4) |
