@@ -15,6 +15,18 @@
 
 ---
 
+<p align="center">
+  <img src="docs/architecture.png" alt="La cadena de explotación, de un vistazo" width="100%">
+</p>
+
+### La cadena de explotación, de un vistazo
+
+El UAF nace en `session.upload_progress`: una subida concurrente libera la sesión mientras PHP sigue usando el `zend_array` (56 bytes, bin 6). Ese slot liberado se reutiliza y el atacante recupera el control del flujo, lo que abre una **RCE sin autenticación** bajo Apache `mod_php`. Todo el trabajo se verificó **solo contra contenedores Docker locales en `127.0.0.1`**, con un test diferencial comportamental que separa la versión vulnerable de la parcheada sin depender de offsets. El backport del commit oficial se compiló y ejecutó sobre 8.2.34: **6/6 UAF sin parchear, 0/6 con el parche**, con `php -v` idéntico en ambos casos.
+
+
+
+---
+
 ## ⚠️ Disclaimer de estado — leer antes de usar este repositorio
 
 Este disclaimer se añadió **al cierre del trabajo** para que nadie confunda
